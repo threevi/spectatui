@@ -287,7 +287,7 @@ fn draw_quit_confirm(frame: &mut Frame, app: &App, area: Rect) {
 
     let lines = vec![
         Line::from(Span::styled(
-            "  Sessions keep running in tmux.",
+            format!("  Sessions keep running in {}.", app.config.mux_backend),
             Style::default().fg(theme.fg),
         )),
         Line::default(),

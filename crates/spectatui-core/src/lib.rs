@@ -1,3 +1,3 @@
 pub mod layout;
+pub mod mux;
 pub mod speckit;
-pub mod tmux;

@@ -10,7 +10,7 @@ use spectatui_core::speckit::registry::{CatalogSource, CatalogTarget};
 use spectatui_core::speckit::{
     ExtensionInfo, IntegrationInfo, PresetInfo, Project, TasksProgress, WorkflowInfo,
 };
-use spectatui_core::tmux::TmuxSession;
+use spectatui_core::mux::{MuxBackend, MuxSession};
 use tokio::sync::mpsc;
 
 use crate::config::{self, AppConfig};
@@ -161,9 +161,11 @@ pub enum SettingsRow {
     Accent,
     DashboardLayout,
     AgentTailFollow,
+    AgentOutputColor,
     MouseSupport,
     ConfirmForce,
-    TmuxPrefix,
+    SessionPrefix,
+    MuxBackend,
     CustomizePanes,
     AttachSession,
     ConfigPath,
@@ -175,9 +177,11 @@ impl SettingsRow {
         Self::Accent,
         Self::DashboardLayout,
         Self::AgentTailFollow,
+        Self::AgentOutputColor,
         Self::MouseSupport,
         Self::ConfirmForce,
-        Self::TmuxPrefix,
+        Self::SessionPrefix,
+        Self::MuxBackend,
         Self::CustomizePanes,
         Self::AttachSession,
         Self::ConfigPath,
@@ -189,9 +193,11 @@ impl SettingsRow {
             Self::Accent => "Accent palette",
             Self::DashboardLayout => "Dashboard layout",
             Self::AgentTailFollow => "Agent tail follow",
+            Self::AgentOutputColor => "Agent output color",
             Self::MouseSupport => "Mouse support",
             Self::ConfirmForce => "Confirm before --force",
-            Self::TmuxPrefix => "tmux session prefix",
+            Self::SessionPrefix => "Session name prefix",
+            Self::MuxBackend => "Session backend",
             Self::CustomizePanes => "Customize panes",
             Self::AttachSession => "Attach agent session",
             Self::ConfigPath => "Config location",
@@ -205,9 +211,12 @@ impl SettingsRow {
             Self::Accent => &["indigo", "teal", "amber"],
             Self::DashboardLayout => &["overview", "coding", "audit"],
             Self::AgentTailFollow => &["on", "off"],
+            Self::AgentOutputColor => &["on", "off"],
             Self::MouseSupport => &["on", "off"],
             Self::ConfirmForce => &["always", "never"],
             Self::ConfigPath => config::CONFIG_LOCATIONS,
+            Self::SessionPrefix => &[],
+            Self::MuxBackend => &["tmux", "herdr"],
             _ => &[],
         }
     }
@@ -215,7 +224,7 @@ impl SettingsRow {
     /// Whether this row is a free-text field (edited inline) rather than a
     /// chip/option or action row.
     pub fn is_text(&self) -> bool {
-        matches!(self, Self::TmuxPrefix)
+        matches!(self, Self::SessionPrefix)
     }
 }
 
@@ -316,9 +325,13 @@ pub struct App {
     pub pending_action: Option<CliAction>,
     pub force_flag: bool,
 
-    // Tmux
-    pub tmux_available: bool,
-    pub tmux_session: Option<TmuxSession>,
+    // Mux (tmux / herdr session backend)
+    pub mux_available: bool,
+    pub mux_session: Option<MuxSession>,
+    /// Whether the active backend supports colored capture (herdr: always; tmux: probed).
+    pub mux_color_capable: bool,
+    /// Lets settings notify the session poller (main.rs) of backend switches.
+    pub backend_tx: Option<tokio::sync::watch::Sender<MuxBackend>>,
 
     // Settings
     pub settings_index: usize,
@@ -448,8 +461,10 @@ impl App {
             pending_action: None,
             force_flag: false,
 
-            tmux_available: false,
-            tmux_session: None,
+            mux_available: false,
+            mux_session: None,
+            mux_color_capable: false,
+            backend_tx: None,
 
             settings_index: 0,
             settings_editing: None,
@@ -509,9 +524,10 @@ impl App {
             .map(|i| i.key.clone())
     }
 
-    /// tmux session name spectatui creates/looks for a feature's coding-agent session.
+    /// Session name spectatui creates/looks for a feature's coding-agent
+    /// session (tmux session name or herdr workspace label).
     pub fn session_name_for(&self, feature_id: &str) -> String {
-        format!("{}{}", self.config.tmux_prefix, feature_id)
+        format!("{}{}", self.config.mux_prefix, feature_id)
     }
 
     /// Register a clickable region for the current frame. Last-registered wins
@@ -990,17 +1006,17 @@ impl App {
 
     pub fn settings_edit_push(&mut self, c: char) {
         if self.settings_editing.is_some()
-            && SettingsRow::ALL[self.settings_index] == SettingsRow::TmuxPrefix
+            && SettingsRow::ALL[self.settings_index] == SettingsRow::SessionPrefix
         {
-            self.config.tmux_prefix.push(c);
+            self.config.mux_prefix.push(c);
         }
     }
 
     pub fn settings_edit_backspace(&mut self) {
         if self.settings_editing.is_some()
-            && SettingsRow::ALL[self.settings_index] == SettingsRow::TmuxPrefix
+            && SettingsRow::ALL[self.settings_index] == SettingsRow::SessionPrefix
         {
-            self.config.tmux_prefix.pop();
+            self.config.mux_prefix.pop();
         }
     }
 
@@ -1030,6 +1046,10 @@ impl App {
                 self.config.agent_tail_follow = value == "on";
                 let _ = config::save_config(&self.config);
             }
+            SettingsRow::AgentOutputColor => {
+                self.config.agent_output_color = value == "on";
+                let _ = config::save_config(&self.config);
+            }
             SettingsRow::MouseSupport => {
                 self.config.mouse_support = value == "on";
                 let _ = config::save_config(&self.config);
@@ -1037,6 +1057,17 @@ impl App {
             SettingsRow::ConfirmForce => {
                 self.config.confirm_before_force = value == "always";
                 let _ = config::save_config(&self.config);
+            }
+            SettingsRow::MuxBackend => {
+                if let Ok(backend) = value.parse::<MuxBackend>() {
+                    if self.config.mux_backend != backend {
+                        self.config.mux_backend = backend;
+                        let _ = config::save_config(&self.config);
+                        if let Some(tx) = &self.backend_tx {
+                            let _ = tx.send(backend);
+                        }
+                    }
+                }
             }
             SettingsRow::ConfigPath => {
                 if value == self.config.config_location {
@@ -1073,6 +1104,12 @@ impl App {
                 "off"
             }
             .to_string(),
+            SettingsRow::AgentOutputColor => if self.config.agent_output_color {
+                "on"
+            } else {
+                "off"
+            }
+            .to_string(),
             SettingsRow::MouseSupport => if self.config.mouse_support {
                 "on"
             } else {
@@ -1085,7 +1122,8 @@ impl App {
                 "never"
             }
             .to_string(),
-            SettingsRow::TmuxPrefix => self.config.tmux_prefix.clone(),
+            SettingsRow::MuxBackend => self.config.mux_backend.as_str().to_string(),
+            SettingsRow::SessionPrefix => self.config.mux_prefix.clone(),
             SettingsRow::CustomizePanes => "open layout editor →".to_string(),
             SettingsRow::AttachSession => format!(
                 "{} →",
@@ -1097,9 +1135,18 @@ impl App {
         }
     }
 
-    /// Apply a tmux poll result: recompute which features have live sessions
-    /// and store the snapshot for the selected feature.
-    pub fn apply_tmux(&mut self, sessions: Vec<String>, session: Option<TmuxSession>) {
+    /// Apply a mux (tmux/herdr) poll result: recompute which features have
+    /// live sessions, refresh backend availability, and store the snapshot
+    /// for the selected feature.
+    pub fn apply_mux(
+        &mut self,
+        sessions: Vec<String>,
+        session: Option<MuxSession>,
+        available: bool,
+        color_capable: bool,
+    ) {
+        self.mux_available = available;
+        self.mux_color_capable = color_capable;
         self.running_features = self
             .project
             .features
@@ -1112,7 +1159,7 @@ impl App {
         // snapshot for the same session instead of adopting the freshly captured one.
         let session = match session {
             Some(mut new) if !self.config.agent_tail_follow => {
-                if let Some(old) = &self.tmux_session {
+                if let Some(old) = &self.mux_session {
                     if old.name == new.name {
                         new.last_snapshot = old.last_snapshot.clone();
                     }
@@ -1121,12 +1168,35 @@ impl App {
             }
             other => other,
         };
-        self.tmux_session = session;
+        self.mux_session = session;
     }
 
-    /// The tmux target (session name) for the currently attached session, if any.
+    /// The attach target for the current session: tmux session name or herdr
+    /// terminal id.
     pub fn attach_target(&self) -> Option<String> {
-        self.tmux_session.as_ref().map(|s| s.name.clone())
+        self.mux_session.as_ref().map(|s| s.attach_target.clone())
+    }
+
+    /// Whether the selected feature has its own session (as opposed to the
+    /// project-workspace fallback, which the poller uses so the agent pane
+    /// still tails a live agent even without a per-feature session).
+    ///
+    /// Drives the "launch" affordance: Enter on the agent pane should offer
+    /// to start an agent only when the selected feature does not already have
+    /// a session of its own.
+    pub fn feature_has_session(&self) -> bool {
+        let Some(selection) = self.selected_feature() else {
+            return false;
+        };
+        let per_feature_name = self.session_name_for(&selection.id);
+        self.mux_session
+            .as_ref()
+            .is_some_and(|s| s.name == per_feature_name)
+    }
+
+    /// The pane target for sending keys: tmux session name or herdr pane id.
+    pub fn send_target(&self) -> Option<String> {
+        self.mux_session.as_ref().map(|s| s.pane_id.clone())
     }
 
     pub fn refresh_project(&mut self) {

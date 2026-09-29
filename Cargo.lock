@@ -1471,6 +1471,7 @@ dependencies = [
 name = "spectatui"
 version = "1.1.0"
 dependencies = [
+ "anstyle-parse",
  "anyhow",
  "clap",
  "crossterm",

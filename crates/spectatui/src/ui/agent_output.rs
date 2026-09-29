@@ -3,9 +3,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 use ratatui::Frame;
 
-use spectatui_core::tmux::SessionStatus;
+use spectatui_core::mux::SessionStatus;
 
 use crate::app::{App, Pane};
+use crate::ui::ansi::{ansi_to_line, strip_ansi};
 
 pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     let theme = &app.theme;
@@ -38,7 +39,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let (status_dot, status_text, status_style) = match app.tmux_session.as_ref().map(|s| s.status)
+    let (status_dot, status_text, status_style) = match app.mux_session.as_ref().map(|s| s.status)
     {
         Some(SessionStatus::Running) => ("●", "running", theme.good_style),
         Some(SessionStatus::Idle) => ("○", "idle", theme.faint_style),
@@ -59,17 +60,29 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
 
     let mut lines: Vec<Line> = Vec::new();
 
-    if let Some(session) = &app.tmux_session {
+    let color_enabled = app.config.agent_output_color && app.mux_color_capable;
+
+    if let Some(session) = &app.mux_session {
         let visible_lines = inner.height.saturating_sub(3) as usize;
         let snapshot = &session.last_snapshot;
         let start = snapshot.len().saturating_sub(visible_lines);
         for line in &snapshot[start..] {
-            lines.push(Line::from(Span::styled(line.to_string(), theme.dim_style)));
+            if color_enabled {
+                lines.push(ansi_to_line(line));
+            } else {
+                // Snapshot may contain raw ANSI when captured with color —
+                // strip it so no escape bytes leak into the plain render.
+                lines.push(Line::from(Span::styled(
+                    strip_ansi(line),
+                    theme.dim_style,
+                )));
+            }
         }
     } else if !app.agent_lines.is_empty() {
         let visible_lines = inner.height.saturating_sub(3) as usize;
         let start = app.agent_lines.len().saturating_sub(visible_lines);
         for line in &app.agent_lines[start..] {
+            // agent_lines are plain text from `specify run` — no ANSI.
             lines.push(Line::from(Span::styled(line.to_string(), theme.dim_style)));
         }
     } else {

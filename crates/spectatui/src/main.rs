@@ -20,7 +20,7 @@ use spectatui_core::speckit::cli::{CliAction, CliTarget, SpecifyCliClient};
 use spectatui_core::speckit::registry;
 use spectatui_core::speckit::watch::{self, FsEvent};
 use spectatui_core::speckit::Project;
-use spectatui_core::tmux::TmuxClient;
+use spectatui_core::mux::{MuxBackend, MuxClient};
 
 use app::{
     palette_commands, App, ClickAction, DashboardLayout, ExtTab, PaletteAction, Pane, PopupKind,
@@ -65,8 +65,9 @@ async fn main() -> Result<()> {
 
     let mut app = App::new(project, app_config);
 
-    // Check tmux availability
-    app.tmux_available = TmuxClient::has_tmux().await;
+    // Check session-backend availability (tmux / herdr).
+    app.mux_available = MuxClient::is_available(app.config.mux_backend).await;
+    app.mux_color_capable = MuxClient::supports_color_capture(app.config.mux_backend).await;
 
     // Set up terminal
     terminal::enable_raw_mode()?;
@@ -121,25 +122,67 @@ async fn run_loop(
     // CLI client
     let cli_client = SpecifyCliClient::new(root.to_path_buf());
 
-    // Selected-feature channel: the tmux poller reads the latest selection so it
-    // can capture the right pane without owning app state.
+    // Selected-feature channel: the session poller reads the latest selection so
+    // it can capture the right pane without owning app state.
     let (selection_tx, selection_rx) =
         tokio::sync::watch::channel(app.selected_feature().map(|f| f.id.clone()));
 
-    // tmux poller — emits TmuxChanged off the Tick path.
-    if app.tmux_available {
-        let tmux_tx = event_tx.clone();
+    // Project-level workspace label (prefix + project directory name, e.g.
+    // "spectatui-spectatui"): the per-project herdr workspace that hosts
+    // agent tabs when spectatui runs inside herdr.
+    let project_label = app
+        .project
+        .root
+        .file_name()
+        .map(|name| format!("{}{}", app.config.mux_prefix, name.to_string_lossy()));
+
+    // Session poller — emits MuxChanged off the Tick path. Always runs; it
+    // idles cheaply when the configured backend isn't installed and picks up
+    // backend switches made in Settings via the backend watch channel.
+    {
+        let event_tx = event_tx.clone();
         let selection_rx = selection_rx.clone();
+        let initial_backend = app.config.mux_backend;
+        let (backend_tx, mut backend_rx) = tokio::sync::watch::channel(initial_backend);
+        app.backend_tx = Some(backend_tx);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(750));
+            let mut backend = initial_backend;
+            let mut available = MuxClient::is_available(backend).await;
+            let mut color_capable = MuxClient::supports_color_capture(backend).await;
             loop {
                 interval.tick().await;
-                let sessions = TmuxClient::list_sessions().await.unwrap_or_default();
+                if *backend_rx.borrow_and_update() != backend {
+                    backend = (*backend_rx.borrow()).clone();
+                    available = MuxClient::is_available(backend).await;
+                    color_capable = MuxClient::supports_color_capture(backend).await;
+                }
+                let sessions = MuxClient::list_sessions(backend).await;
                 let selected = selection_rx.borrow().clone();
                 let session = match selected {
                     Some(id) => {
-                        if let Some(mut s) = TmuxClient::find_session(&id).await {
-                            if let Ok(lines) = TmuxClient::capture_pane(&s.name, 50).await {
+                        // Per-feature session first (label contains the feature
+                        // id); fall back to the project workspace, which holds
+                        // agent tabs when spectatui runs inside herdr.
+                        let mut s = MuxClient::find_session(backend, &id).await;
+                        if s.is_none() {
+                            if let Some(label) = &project_label {
+                                s = MuxClient::find_project_session(backend, label)
+                                    .await;
+                            }
+                        }
+                        if let Some(mut s) = s {
+                            // Always capture with ANSI when the backend supports
+                            // it; the render side decides whether to parse the
+                            // escapes or strip them (config.agent_output_color).
+                            if let Ok(lines) = MuxClient::capture_pane(
+                                backend,
+                                &s.pane_id,
+                                50,
+                                color_capable,
+                            )
+                            .await
+                            {
                                 s.last_snapshot = lines;
                             }
                             Some(s)
@@ -149,8 +192,13 @@ async fn run_loop(
                     }
                     None => None,
                 };
-                if tmux_tx
-                    .send(AppEvent::TmuxChanged { sessions, session })
+                if event_tx
+                    .send(AppEvent::MuxChanged {
+                        sessions,
+                        session,
+                        available,
+                        color_capable,
+                    })
                     .is_err()
                 {
                     return;
@@ -208,7 +256,7 @@ async fn run_loop(
             }
         }
 
-        // Publish the current selection for the tmux poller.
+        // Publish the current selection for the session poller.
         let _ = selection_tx.send(app.selected_feature().map(|f| f.id.clone()));
 
         if let Some(event) = events.next().await {
@@ -272,8 +320,8 @@ async fn run_loop(
                         app.cat_add_insert_str(&text);
                     }
                 }
-                AppEvent::TmuxChanged { sessions, session } => {
-                    app.apply_tmux(sessions, session);
+                AppEvent::MuxChanged { sessions, session, available, color_capable } => {
+                    app.apply_mux(sessions, session, available, color_capable);
                 }
                 AppEvent::Tick => {
                     app.indexing_tick = app.indexing_tick.wrapping_add(1);
@@ -323,10 +371,12 @@ fn spawn_catalog_sources_fetch(
     });
 }
 
-/// Suspend the TUI, run a foreground tmux attach to `target`, then restore
-/// the alternate screen / raw mode when the tmux process exits (on detach).
+/// Suspend the TUI, run a foreground attach to `target` on the given backend
+/// (tmux attach / herdr terminal attach), then restore the alternate screen /
+/// raw mode when the attach process exits (on detach).
 async fn attach_to(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    backend: MuxBackend,
     target: &str,
     mouse_support: bool,
 ) -> Result<()> {
@@ -340,7 +390,7 @@ async fn attach_to(
     terminal::disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
 
-    let attach_result = TmuxClient::attach(target).await;
+    let attach_result = MuxClient::attach(backend, target).await;
 
     // Restore the TUI.
     terminal::enable_raw_mode()?;
@@ -353,7 +403,7 @@ async fn attach_to(
     attach_result
 }
 
-/// Attach to the currently selected feature's live tmux session, if any.
+/// Attach to the currently selected feature's live session, if any.
 async fn attach_session(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
@@ -361,20 +411,27 @@ async fn attach_session(
     let Some(target) = app.attach_target() else {
         return Ok(());
     };
-    if !app.tmux_available {
+    if !app.mux_available {
         return Ok(());
     }
-    attach_to(terminal, &target, app.config.mouse_support).await
+    attach_to(
+        terminal,
+        app.config.mux_backend,
+        &target,
+        app.config.mouse_support,
+    )
+    .await
 }
 
-/// Create a tmux session running the default coding agent for the selected
-/// feature, then attach to it. No-ops if tmux is unavailable, no feature is
-/// selected, or no default coding agent is configured.
+/// Create a session (tmux session / herdr workspace) running the default
+/// coding agent for the selected feature, then attach to it. No-ops if the
+/// backend is unavailable, no feature is selected, or no default coding agent
+/// is configured.
 async fn launch_session(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
 ) -> Result<()> {
-    if !app.tmux_available {
+    if !app.mux_available {
         return Ok(());
     }
     let Some(feature_id) = app.selected_feature().map(|f| f.id.clone()) else {
@@ -383,15 +440,27 @@ async fn launch_session(
     let Some(agent_cmd) = app.default_agent_key() else {
         return Ok(());
     };
+    let backend = app.config.mux_backend;
     let session_name = app.session_name_for(&feature_id);
     let cwd = app.project.root.clone();
-    if TmuxClient::launch_session(&session_name, &cwd, &agent_cmd)
-        .await
-        .is_err()
-    {
+    let Ok(launch) = MuxClient::launch_session(backend, &session_name, &cwd, &agent_cmd).await
+    else {
+        return Ok(());
+    };
+    if !launch.attach {
+        // The agent was created as a new tab in the current herdr workspace —
+        // the user is already inside herdr and switches to it themselves, so
+        // there is nothing to attach to.
         return Ok(());
     }
-    attach_to(terminal, &session_name, app.config.mouse_support).await
+    // Resolve the new session's attach target (tmux: session name; herdr:
+    // terminal id). Fall back to the session name if the poller hasn't seen
+    // it yet.
+    let target = MuxClient::find_session(backend, &feature_id)
+        .await
+        .map(|s| s.attach_target)
+        .unwrap_or_else(|| session_name.clone());
+    attach_to(terminal, backend, &target, app.config.mouse_support).await
 }
 
 fn handle_key(app: &mut App, key: KeyEvent, cli_client: &SpecifyCliClient) {
@@ -884,12 +953,14 @@ fn handle_key(app: &mut App, key: KeyEvent, cli_client: &SpecifyCliClient) {
         return;
     }
 
+    // Global QUIT shortcut
+    if key.code == KeyCode::Char('q') {
+        app.open_popup(PopupKind::QuitConfirm);
+        return;
+    }
+
     // Global keys (available on all screens)
     match key.code {
-        KeyCode::Char('q') => {
-            app.open_popup(PopupKind::QuitConfirm);
-            return;
-        }
         KeyCode::Char('t') => {
             app.toggle_theme();
             return;
@@ -936,28 +1007,39 @@ fn handle_key(app: &mut App, key: KeyEvent, cli_client: &SpecifyCliClient) {
         Screen::SpecBrowser => handle_spec_browser_key(app, key),
         Screen::Constitution => handle_constitution_key(app, key),
         Screen::Settings => handle_settings_key(app, key, cli_client),
-        Screen::SessionAttach => match key.code {
-            KeyCode::Esc => app.go_back(),
-            KeyCode::Backspace => {
-                app.attach_input.pop();
+        Screen::SessionAttach => handle_session_attach_key(app, key),
+    }
+}
+
+fn handle_session_attach_key(app: &mut App, key: crossterm::event::KeyEvent) {
+    // `q` on this screen detaches from the attached pane and returns to the
+    // dashboard — the herdr way out; the dashboard's global `q` still quits.
+    if key.code == KeyCode::Char('q') {
+        app.go_back();
+        return;
+    }
+    match key.code {
+        KeyCode::Esc => app.go_back(),
+        KeyCode::Backspace => {
+            app.attach_input.pop();
+        }
+        KeyCode::Char(c) => {
+            app.attach_input.push(c);
+        }
+        KeyCode::Enter => {
+            if app.attach_input.is_empty() {
+                // Empty input: go full-screen and attach to the live pane.
+                app.attach_request = true;
+            } else if let Some(target) = app.send_target() {
+                // Send the typed follow-up to the agent pane.
+                let backend = app.config.mux_backend;
+                let text = std::mem::take(&mut app.attach_input);
+                tokio::spawn(async move {
+                    let _ = MuxClient::send_keys(backend, &target, &text).await;
+                });
             }
-            KeyCode::Char(c) => {
-                app.attach_input.push(c);
-            }
-            KeyCode::Enter => {
-                if app.attach_input.is_empty() {
-                    // Empty input: go full-screen and attach to the live pane.
-                    app.attach_request = true;
-                } else if let Some(target) = app.attach_target() {
-                    // Send the typed follow-up to the agent pane.
-                    let text = std::mem::take(&mut app.attach_input);
-                    tokio::spawn(async move {
-                        let _ = TmuxClient::send_keys(&target, &text).await;
-                    });
-                }
-            }
-            _ => {}
-        },
+        }
+        _ => {}
     }
 }
 
@@ -967,7 +1049,11 @@ fn handle_dashboard_key(app: &mut App, key: KeyEvent, _cli_client: &SpecifyCliCl
         KeyCode::BackTab => app.cycle_tab_backward(),
         KeyCode::Up | KeyCode::Char('k') => app.select_prev_feature(),
         KeyCode::Down | KeyCode::Char('j') => app.select_next_feature(),
-        KeyCode::Enter if app.focused_pane == Pane::AgentOutput && app.tmux_session.is_none() => {
+        // Launch is offered only while the selected feature has no
+        // per-feature session. With the project-workspace layout the poller
+        // falls back to the project session, so mux_session is Some even then
+        // — gate on the per-feature name instead.
+        KeyCode::Enter if app.focused_pane == Pane::AgentOutput && !app.feature_has_session() => {
             app.launch_request = true;
         }
         KeyCode::Enter => app.enter_spec_browser(),
@@ -996,8 +1082,8 @@ fn handle_spec_browser_key(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Tab => app.cycle_tab_forward(),
         KeyCode::BackTab => app.cycle_tab_backward(),
-        KeyCode::Up | KeyCode::Char('k') => app.scroll_up(),
-        KeyCode::Down | KeyCode::Char('j') => app.scroll_down(),
+        KeyCode::Up | KeyCode::Char('j') => app.scroll_down(),
+        KeyCode::Down | KeyCode::Char('k') => app.scroll_up(),
         KeyCode::Left => {
             app.select_prev_feature();
             app.spec_scroll = 0;
@@ -1013,8 +1099,8 @@ fn handle_spec_browser_key(app: &mut App, key: KeyEvent) {
 
 fn handle_constitution_key(app: &mut App, key: KeyEvent) {
     match key.code {
-        KeyCode::Up | KeyCode::Char('k') => app.scroll_up(),
-        KeyCode::Down | KeyCode::Char('j') => app.scroll_down(),
+        KeyCode::Up | KeyCode::Char('j') => app.scroll_down(),
+        KeyCode::Down | KeyCode::Char('k') => app.scroll_up(),
         KeyCode::Esc => app.go_back(),
         _ => {}
     }

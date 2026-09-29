@@ -34,13 +34,13 @@ A terminal UI dashboard for [GitHub Spec-Kit](https://github.com/github/spec-kit
 - 📖 **Spec / Plan / Tasks / Research browser** — Navigate `spec.md`, `plan.md`, `tasks.md`, `research.md` with rendered Markdown and task checkboxes
 - 📜 **Constitution viewer** — Read your project's `.specify/memory/constitution.md` from any screen
 - 🪜 **Workflow stepper** — Visual stage tracker across `cons → spec → clar → plan → task → anly → impl` with task progress bar
-- 🔗 **Session attach** — Suspend the TUI and hand off to a live tmux session; send follow-up messages inline
-- 🖥️ **Agent output pane** — Live tail of the tmux agent session with attach/refresh/kill controls
+- 🔗 **Session attach** — Suspend the TUI and hand off to a live tmux session or herdr workspace; send follow-up messages inline
+- 🖥️ **Agent output pane** — Live tail of the agent session (tmux / herdr) with attach/refresh/kill controls
 - 📤 **CLI job output popup** — Dedicated scrollable view for spawned CLI job output
 - 🎯 **Command palette** — Quick-navigate and execute commands (`:` or `Ctrl-K`)
 - 🗂️ **Multi-pane dashboard** — Overview, Coding, Audit, and Custom layouts (switch with `1`–`4`); drag panel borders for continuous resizing
 - 🎨 **Custom layout editor** — Reorder, resize, and toggle visibility of panes; save as your own layout
-- ⚙️ **Settings editor** — In-app settings: theme, accent, dashboard layout, mouse support, tmux prefix, and more, persited globally or per-project
+- ⚙️ **Settings editor** — In-app settings: theme, accent, dashboard layout, mouse support, session backend (tmux / herdr), session prefix, and more, persited globally or per-project
 - 🌓 **Dark & light themes** — Toggle with `t`
 - 🌈 **Accent palette** — Cycle through Indigo, Teal, and Amber with `T`
 - 🐭 **Mouse support** — Optional click support for list rows, tabs, status-bar counters, and settings chips

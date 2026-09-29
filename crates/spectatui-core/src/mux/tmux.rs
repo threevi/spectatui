@@ -1,24 +1,12 @@
+//! tmux backend: drives sessions through the `tmux` CLI.
+
 use std::path::Path;
 use std::process::Stdio;
 
 use anyhow::{Context, Result};
 use tokio::process::Command;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SessionStatus {
-    Running,
-    Idle,
-    Exited,
-    NotFound,
-}
-
-#[derive(Debug, Clone)]
-pub struct TmuxSession {
-    pub name: String,
-    pub pane_id: String,
-    pub status: SessionStatus,
-    pub last_snapshot: Vec<String>,
-}
+use super::{MuxLaunch, MuxSession, SessionStatus};
 
 pub struct TmuxClient;
 
@@ -41,7 +29,7 @@ impl TmuxClient {
         }
     }
 
-    pub async fn find_session(feature_id: &str) -> Option<TmuxSession> {
+    pub async fn find_session(feature_id: &str) -> Option<MuxSession> {
         let sessions = Self::list_sessions().await.ok()?;
         let name = sessions.into_iter().find(|s| s.contains(feature_id))?;
 
@@ -68,7 +56,8 @@ impl TmuxClient {
             SessionStatus::Running
         };
 
-        Some(TmuxSession {
+        Some(MuxSession {
+            attach_target: name.clone(),
             name,
             pane_id,
             status,
@@ -76,16 +65,14 @@ impl TmuxClient {
         })
     }
 
-    pub async fn capture_pane(session_name: &str, lines: u16) -> Result<Vec<String>> {
+    pub async fn capture_pane(session_name: &str, lines: u16, color: bool) -> Result<Vec<String>> {
+        let scroll = format!("-{lines}");
+        let mut args: Vec<&str> = vec!["capture-pane", "-t", session_name, "-p", "-S", &scroll];
+        if color {
+            args.push("-e");
+        }
         let output = Command::new("tmux")
-            .args([
-                "capture-pane",
-                "-t",
-                session_name,
-                "-p",
-                "-S",
-                &format!("-{lines}"),
-            ])
+            .args(&args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .output()
@@ -127,7 +114,11 @@ impl TmuxClient {
     /// Create a new detached tmux session running `command` in `cwd`.
     ///
     /// The session is left detached (`-d`); the caller attaches separately.
-    pub async fn launch_session(session_name: &str, cwd: &Path, command: &str) -> Result<()> {
+    pub async fn launch_session(
+        session_name: &str,
+        cwd: &Path,
+        command: &str,
+    ) -> Result<MuxLaunch> {
         Command::new("tmux")
             .args(["new-session", "-d", "-s", session_name, "-c"])
             .arg(cwd)
@@ -137,7 +128,10 @@ impl TmuxClient {
             .output()
             .await
             .context("failed to create tmux session")?;
-        Ok(())
+        Ok(MuxLaunch {
+            name: session_name.to_string(),
+            attach: true,
+        })
     }
 
     /// Attach to a tmux session as a foreground process with inherited stdio.

@@ -6,7 +6,7 @@ use tokio::sync::mpsc;
 use spectatui_core::speckit::registry::{CatalogSource, CatalogTarget};
 use spectatui_core::speckit::watch::FsEvent;
 use spectatui_core::speckit::{ExtensionInfo, IntegrationInfo, PresetInfo, WorkflowInfo};
-use spectatui_core::tmux::TmuxSession;
+use spectatui_core::mux::MuxSession;
 
 #[allow(dead_code)]
 pub enum AppEvent {
@@ -14,9 +14,15 @@ pub enum AppEvent {
     Mouse(MouseEvent),
     Tick,
     FsChanged(FsEvent),
-    TmuxChanged {
+    MuxChanged {
         sessions: Vec<String>,
-        session: Option<TmuxSession>,
+        session: Option<MuxSession>,
+        /// Whether the configured backend binary is installed; refreshed by
+        /// the poller whenever the backend (or its availability) changes.
+        available: bool,
+        /// Whether the backend supports ANSI color capture (tmux `capture-pane -e`, herdr
+        /// `pane read --ansi`). Equivalent to `available` for the two supported backends.
+        color_capable: bool,
     },
     Resize(u16, u16),
     CatalogIndexed {

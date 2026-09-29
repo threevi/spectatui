@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::theme::{Accent, ThemeMode};
 use spectatui_core::layout::{CustomLayout, DashboardSizes};
+use spectatui_core::mux::MuxBackend;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -19,9 +20,15 @@ pub struct AppConfig {
     #[serde(default = "default_true")]
     pub agent_tail_follow: bool,
     #[serde(default = "default_true")]
+    pub agent_output_color: bool,
+    #[serde(default = "default_true")]
     pub confirm_before_force: bool,
-    #[serde(default = "default_tmux_prefix")]
-    pub tmux_prefix: String,
+    #[serde(default)]
+    pub mux_backend: MuxBackend,
+    /// Prefix for the session name created per feature (tmux session name or
+    /// herdr workspace label). Old `tmux_prefix` keys are read via alias.
+    #[serde(default = "default_mux_prefix", alias = "tmux_prefix")]
+    pub mux_prefix: String,
     #[serde(default = "default_config_location")]
     pub config_location: String,
     #[serde(default)]
@@ -42,7 +49,7 @@ fn default_layout() -> String {
 fn default_true() -> bool {
     true
 }
-fn default_tmux_prefix() -> String {
+fn default_mux_prefix() -> String {
     "spectatui-".to_string()
 }
 fn default_config_location() -> String {
@@ -64,8 +71,10 @@ impl Default for AppConfig {
             dashboard_layout: default_layout(),
             mouse_support: true,
             agent_tail_follow: true,
+            agent_output_color: true,
             confirm_before_force: true,
-            tmux_prefix: default_tmux_prefix(),
+            mux_backend: MuxBackend::default(),
+            mux_prefix: default_mux_prefix(),
             config_location: default_config_location(),
             custom_layout: None,
             dashboard_sizes: DashboardSizes::default(),

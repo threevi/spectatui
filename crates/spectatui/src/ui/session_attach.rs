@@ -3,9 +3,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 use ratatui::Frame;
 
-use spectatui_core::tmux::SessionStatus;
+use spectatui_core::mux::SessionStatus;
 
 use crate::app::App;
+use crate::ui::ansi::{ansi_to_line, strip_ansi};
 
 pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     let theme = &app.theme;
@@ -17,7 +18,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     let agent_name = app.default_agent_name();
 
     let is_running = matches!(
-        app.tmux_session.as_ref().map(|s| s.status),
+        app.mux_session.as_ref().map(|s| s.status),
         Some(SessionStatus::Running)
     );
 
@@ -40,14 +41,20 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                 .add_modifier(ratatui::style::Modifier::BOLD),
         ),
         Span::styled(
-            format!("  {feature_id}  ·  {agent_name}  ·  tmux"),
+            format!(
+                "  {feature_id}  ·  {agent_name}  ·  {}",
+                app.config.mux_backend
+            ),
             ratatui::style::Style::default()
                 .fg(theme.dim)
                 .bg(theme.header_bg),
         ),
     ];
 
-    let right_text = "Ctrl-b d detach  ·  esc back to spectatui";
+    let right_text = format!(
+        "{} detach  ·  esc back to spectatui",
+        app.config.mux_backend.detach_hint()
+    );
     let left_width: u16 = top_spans.iter().map(|s| s.width() as u16).sum();
     let pad = full
         .width
@@ -75,7 +82,9 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     let input_y = full.height.saturating_sub(6);
     let transcript_h = input_y.saturating_sub(transcript_y);
 
-    if let Some(session) = &app.tmux_session {
+    let color_enabled = app.config.agent_output_color && app.mux_color_capable;
+
+    if let Some(session) = &app.mux_session {
         let visible = transcript_h as usize;
         let snapshot = &session.last_snapshot;
         let start = snapshot.len().saturating_sub(visible);
@@ -84,11 +93,16 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
             if y >= input_y {
                 break;
             }
-            frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    format!("  {line}"),
+            let rendered = if color_enabled {
+                ansi_to_line(line)
+            } else {
+                Line::from(Span::styled(
+                    format!("  {}", strip_ansi(line)),
                     theme.dim_style,
-                ))),
+                ))
+            };
+            frame.render_widget(
+                Paragraph::new(rendered),
                 Rect::new(full.x, y, full.width, 1),
             );
         }
@@ -160,9 +174,9 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         ),
     ];
     let session_text = if is_running {
-        "● session live in tmux"
+        format!("● session live in {}", app.config.mux_backend)
     } else {
-        "○ no session"
+        "○ no session".to_string()
     };
     let session_style = if is_running {
         theme.good_style
@@ -185,17 +199,18 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     // Key hints (ROWS-1)
     let hints_y = full.height.saturating_sub(1);
     let hints = [
-        ("Ctrl-b d", "detach (keeps running)"),
-        ("esc", "back to dashboard"),
-        ("↑↓", "scroll"),
+        app.config.mux_backend.detach_hint(),
+        "esc",
+        "↑↓",
     ];
+    let hint_descs = ["detach (keeps running)", "back to dashboard", "scroll"];
     let mut hint_spans: Vec<Span> = vec![Span::styled(" ", theme.base)];
-    for (i, (key, desc)) in hints.iter().enumerate() {
+    for i in 0..hints.len() {
         if i > 0 {
             hint_spans.push(Span::styled("  ·  ", theme.faint_style));
         }
-        hint_spans.push(Span::styled(key.to_string(), theme.accent_bold));
-        hint_spans.push(Span::styled(format!(" {desc}"), theme.dim_style));
+        hint_spans.push(Span::styled(hints[i].to_string(), theme.accent_bold));
+        hint_spans.push(Span::styled(format!(" {}", hint_descs[i]), theme.dim_style));
     }
     let hint_bar = Paragraph::new(Line::from(hint_spans)).style(theme.base);
     frame.render_widget(hint_bar, Rect::new(full.x, hints_y, full.width, 1));

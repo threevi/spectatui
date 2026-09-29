@@ -1,3 +1,4 @@
+pub mod ansi;
 mod agent_output;
 mod catalogs;
 mod extensions;
